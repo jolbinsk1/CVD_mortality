@@ -1,0 +1,451 @@
+---
+title: "Bayesian Analysis of Cardiovascular Disease (CVD) Death Risk in European Women Aged 65-69"
+author: 
+  - "Julian Olbinski"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: readable
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    code_download: false
+---
+
+```{r setup, include = FALSE}
+options(max.print= 120,
+        width = 90,
+        tibble.width = 80)
+knitr::opts_chunk$set(echo= TRUE,
+                      cache=FALSE,
+                      prompt=FALSE,
+                      tidy="styler",
+                      comment=NA,
+                      message=FALSE,
+                      warning=TRUE)
+
+knitr::opts_knit$set(width=90)
+knitr::opts_chunk$set(cache.extra = knitr::rand_seed)
+set.seed(42)
+```
+
+# Bayesian Analysis of CVD Death Risk in European Women Aged 65-69
+
+The following packages were used:
+
+```{r, message = FALSE}
+## Import the necessary libraries
+library(rsample)
+library(dplyr)
+library(brms)
+library(ggplot2)
+library(corrr)
+library(tidyr)
+library(glue)
+library(priorsense)
+library(mice)
+library(priorsense)
+options(mc.cores = parallel::detectCores()) # paralellize if possible
+options(brms.file_refit = "on_change") # save the files if the model has changed
+#nice plotting theme:
+theme_set(theme_linedraw() +
+            theme(panel.grid = element_blank()))
+```
+
+## 1. Dataset Selection
+
+For this project, I worked with data from the 2021 Global Burden of Disease (GBD) study provided by the Institute for Health Metrics and Evaluation (IHME) (https://vizhub.healthdata.org/gbd-results/). After creating a free account, I accessed data on cardiovascular disease (CVD) mortality along with lifestyle factors such as daily fiber intake. I then merged these datasets and also explored incorporating data on tobacco use from Our World in Data (https://ourworldindata.org/grapher/share-of-adults-who-are-smoking-by-level-of-prosperity). However, due to excessive missing values, I decided not to include tobacco use in the final analysis.
+
+Because the dataset was still large (10,000+ observations), I narrowed the focus to a more specific subgroup: females aged 65–69, resulting in 456 observations. I also joined GDP per capita data (sourced from Our World in Data: https://ourworldindata.org/grapher/gdp-per-capita-worldbank) to enrich the dataset and provide socioeconomic context for the analysis.
+
+```{r}
+# load the data and begin preprocessing
+cvd <- read.csv("./CVD_death_percent_updated.csv") 
+
+# the trans-fat column contained 0s, which I reasoned were used in place of missing values.  
+# I replaced these with NA and then applied multiple imputation, allowing me to 
+# preserve the number of rows for model comparison and maintain the distribution of values.  
+# Since trans-fat intake was highly right-skewed and needed to be log-transformed, handling the 0s in this way was essential.  
+# in contrast, the tobacco use column only had entries for 2010 and 2015, leaving most values missing.  
+# because imputing such a large proportion would introduce too much noise, I excluded this variable.  
+
+# change zeros to NA
+cvd$trans_fat_pct_kcal_day[cvd$trans_fat_pct_kcal_day == 0] <- NA
+
+# multiple imputation for trans fat 
+miceOut <- mice(
+  data = cvd,
+  seed = 42,
+  m = 10, 
+  maxit = 5, 
+  method = "pmm"
+)
+
+completed_data <- complete(miceOut, 1)
+cvd$trans_fat_pct_kcal_day <- completed_data$trans_fat_pct_kcal_day
+
+# Because I wanted to predict the percentage of deaths attributed to CVD relative to total deaths,  
+# I needed to fit a Beta regression model. This required the target variable to be bounded between 0 and 1.  
+# Therefore, I divided percent_of_cvd_deaths by 100 to transform it into a proportion.  
+
+# adjust the target variable for Beta regression
+cvd$proportion_of_cvd_deaths <- cvd$percent_of_cvd_deaths/100
+
+# I also decided to add GDP per capita as a predictor to provide socioeconomic context.  
+# I merged this feature from a separate dataset sourced from Our World in Data.  
+
+gdp_data <- read.csv("https://ourworldindata.org/grapher/gdp-per-capita-worldbank.csv?v=1&csvType=full&useColumnShortNames=true")
+gdp_data
+
+colnames(gdp_data)[colnames(gdp_data) == "Entity"] <- "country"
+colnames(gdp_data)[colnames(gdp_data) == "Year"] <- "year"
+colnames(gdp_data)[colnames(gdp_data) == "ny_gdp_pcap_pp_kd"] <- "gdp_per_capita"
+
+cvd_merged <- merge(cvd, gdp_data[, c("country", "year", "gdp_per_capita")], 
+                     by = c("country", "year"))
+
+# confirm that the merge was successful
+length(cvd_merged)
+length(cvd) 
+
+nrow(cvd_merged) == nrow(cvd)
+sum(is.na(cvd_merged$gdp_per_capita))
+
+# all checks passed, so rename back to cvd
+cvd <- cvd_merged
+
+```
+
+Categorical variables:
+
+-   Country: 38 European countries
+
+-   Sex: male, female
+
+-   age_group: Adults in 5 year age ranges (e.g., 60-64 years).
+
+-   region: 7 custom clusters of European countries by geography
+
+Numeric variables:
+
+-   year: years 2008 to 2019
+
+-   trans_fat_pct_kcal_day: Daily individual percent calorie intake of trans fatty acids estimates
+
+-   sodium_g_per_day: Daily individual intake of sodium in grams estimates
+
+-   fiber_g_per_day: Daily individual intake of fiber in grams estimates
+
+-   fruit_g_per_day: Daily individual intake of fruits in grams estimates
+
+-   legumes_g_per day: Daily individual intake of legumes in grams estimates
+
+-   mean_prev_overweight: Mean prevalence of overweight individuals
+
+-   mean_change_overweight: Mean 5 year change in prevalence of overweight individuals
+
+-   mean_prev_obese: Mean prevalence of obese individuals
+
+-   mean_change_obese: Mean 5 year change in prevalence of obese individuals
+
+-   smoking_or_tobacco_use: Estimated percentage of adults aged 15 years and older who currently smoke or use tobacco. This includes smokeless products, such as chewing or snuffing tobacco, but excludes products that do not contain tobacco, such as e-cigarettes.
+
+-   gdp_billions: gross domestic product (GDP) in billions of USD
+
+-   gdp_per_capita: share of country's GDP per person
+
+-   proportion_of_cvd_deaths: proportion of total deaths caused by cardiovascular disease (CVD) relative to all other causes of death
+
+Also, numerous columns needed to be log transformed due to the right-skewedness of their distributions, which can be seen in the code of question 2.
+
+## 2. Split the data and transform columns
+
+```{r}
+
+# Numerous columns needed to be log transformed due to the right-skewedness of their distributions, which can be seen with this code:
+par(mfrow = c(2, 2))  
+numeric_columns <- sapply(cvd, is.numeric) & names(cvd) != "year"
+for (col in names(cvd)[numeric_columns]) {
+  hist(cvd[[col]], 
+       main = paste(col), 
+       xlab = col, 
+       col = 'red',
+       breaks = 30)
+}
+mtext("Distribution of Target & Features", outer = TRUE, cex = 1.5, font = 2)
+
+# transforming and scaling the data
+cvd <- cvd %>%
+  mutate(s_year = scale(year),
+         s_log_trans_fat_pct_kcal_day = scale(log(trans_fat_pct_kcal_day)),
+         s_log_sodium_g_per_day = scale(log(sodium_g_per_day)),
+         s_log_fiber_g_per_day = scale(log(fiber_g_per_day)),
+         s_log_fruit_g_per_day = scale(log(fruit_g_per_day)),
+         s_log_legumes_g_per_day = scale(log(legumes_g_per_day)),
+         s_mean_prev_overweight = scale(mean_prev_overweight),
+         s_mean_change_overweight = scale(mean_change_overweight),
+         s_log_mean_prev_obese = scale(log(mean_prev_obese)),
+         s_log_mean_change_obese = scale(log(mean_change_obese)),
+         s_smoking_or_tobacco_use = scale(smoking_or_tobacco_use),
+         s_log_gdp = scale(log(gdp_billions)),
+         s_log_gdp_per_cap = scale(log(gdp_per_capita))
+         )
+  
+#filtering the data to only include females in the 65-69 age group
+data_female_65_69 <- cvd %>%
+  filter(sex == "Female", age_group == "65-69 years")
+
+# Split the dataset 
+split <- initial_split(data = data_female_65_69, prop = 0.8, strata = proportion_of_cvd_deaths)
+train_data_female_65_69 <- training(split)
+test_data_female_65_69 <- testing(split)
+
+```
+
+## 3. Model Exploration
+
+mod_1 fits a Beta regression to predict the target variable. In addition to using years, trans-fats per day and mean previous obesity rate, the model also used log GDP per capita as a predictor. This was done to compare its effect to log GDP, since it is possible that countries/regions with a lower GDP than others may have a higher share of GDP per person, which in turn could account for more variance in our target variable. Both metrics were not included due to high potential for multicolinearity. Additionally, (1 \| region/country) was included as a hierarchical effect, which takes into account that countries are nested in regions — helping to model the possibility that countries in a region are more similar to each other than countries in other regions. Therefore, intercepts are generated by region, as well as by countries within a region. The model takes default BRMS priors.
+
+
+mod_2 likewise fits a beta regression model with default priors to predict the probability of the proportion of deaths attributed to CVD out of all deaths in females aged 65-59 in Europe. The model predicts probability of CVD death percentage using year, the mean prevalence of obesity, grams of sodium per day, grams of fiber per day, number of calories from trans fat per day, and the interaction between fiber and trans fat. The model makes predictions using shared information in the country cluster, therefore the model assumes that the country affects CVD death proportion differently, but that the data for each country comes from the same distribution.
+
+
+```{r, message = FALSE, results = "hide"}
+
+
+mod_1 <- brm(formula = proportion_of_cvd_deaths ~ s_year + s_log_trans_fat_pct_kcal_day + 
+                            s_log_mean_prev_obese + s_log_gdp_per_cap + 
+                            (1 | region/country),
+                  data = train_data_female_65_69,
+                  family = Beta(link = "logit"),
+                  control = list(adapt_delta = 0.9, max_treedepth = 15),
+                  seed = 42,
+                  sample_prior = TRUE,
+                  save_pars = save_pars(all = TRUE),
+                  file = "mod_1"
+)
+
+mod_2 <- brm(formula = proportion_of_cvd_deaths ~ s_year + s_log_mean_prev_obese + 
+                            s_log_sodium_g_per_day + 
+                            s_log_fiber_g_per_day * s_log_trans_fat_pct_kcal_day + 
+                            (1 | country),
+                 data = train_data_female_65_69,
+                 family = Beta(link=logit),
+                 seed = 42,
+                 sample_prior = TRUE,
+                 save_pars = save_pars(all = TRUE),
+                 file = "mod_2")
+
+
+```
+
+-  The initial model showed convergence, as indicated by Rhat values all equal to 1 for all intercepts (normal and multilevel), fixed effects, as well as for phi. Both bulk and tail effective sample sizes (ESS) were quite high for all parameters, with the lowest ESS being a bulk ESS of 1,737, indicating good posterior estimation. Additionally, tail ESS was never far lower than bulk ESS, which would indicate that the model explored the tails poorly, leading to grossly inaccurate CIs and poor handling of outliers. Finally, the traceplots did not show funneling or consistent spikes and were generally well mixed. However, I received a warning that there were 7 divergent transitions after warm-up. While this isn't many, it still indicated that there could have been issues in exploring the posterior. Therefore, I added "adapt_delta = 0.9", since R suggested I increase it from its default of 0.8. Doing so would decrease the step size of Monte Carlo, helping to prevent divergences. I also received a warning that maximum tree depth should be increased, so I set max_treedepth = 15, thereby increasing the number of steps taken per iteration.
+
+- The second model shows convergence with Rhat values of 1.00 for most parameters, but with Rhat 1.01 for log sodium intake and the mulitlevel intercept for country. The bulk and tail effective sample sizes (ESS) for some effects were less than 1000, which is acceptable, but overall the ESS values are high, indicating rather robust results for the posterior estimates. The traceplots are well mixed and overlapping for all parameters, with no indication of divergent transitions. The density plots are smooth and unimodal with strong overlap between chains.
+
+
+```{r}
+#checking model outputs
+mod_1
+mod_2
+```
+
+```{r}
+# Trace and density plots
+plot(mod_1)
+plot(mod_2)
+
+# Powerscale sensitivity analysis
+powerscale_sensitivity(mod_1)
+powerscale_sensitivity(mod_2)
+```
+
+## 4. Power Sensitivity Analysis
+
+-   mod_1: The powerscale sensitivity function found a potential prior-data conflict with the phi variable. The large discrepancy between prior and likelihood values for this variable indicate a severe mismatch between the priors and the actual posterior distribution. I reasoned that the default priors did not adequately account for phi. Also, the estimated phi was quite large (CI [1369.59, 1864.09]), so I decided to use a lognormal distribution of (log(1800), 0.25) for phi, amounting to CI[1385, 2400] to better capture the range I found. After running with this prior, I no longer had any warnings, and the CI range of my phi value was within the bounds of my prior.
+
+-   mod_2: The powerscale sensitivity analysis likewise revealed a potential prior-data conflict with the default phi prior. I similarly adjusted the prior for phi to be (log(1800), 0.25) so that the CI of phi would be within this range as well, and also no longer had any warnings
+
+```{r}
+
+# adjust both models
+
+mod_1_lognormal <- brm(formula = proportion_of_cvd_deaths ~ 
+                            s_year +
+                            s_log_trans_fat_pct_kcal_day +
+                            s_log_mean_prev_obese + 
+                            s_log_gdp_per_cap + 
+                            (1 | region/country),
+                  data = train_data_female_65_69,
+                  prior = prior(lognormal(log(1800), 0.25), class = "phi"),  # adjusted priors for phi
+                  control = list(adapt_delta = 0.9, max_treedepth = 15),
+                  family = Beta(link = "logit"),
+                  seed = 42,
+                  save_pars = save_pars(all = TRUE),
+                  file = "mod_1_lognormal"
+)
+
+mod_2_lognormal <- brm(formula = proportion_of_cvd_deaths ~ s_year + s_log_mean_prev_obese + 
+                            s_log_sodium_g_per_day + 
+                            s_log_fiber_g_per_day * s_log_trans_fat_pct_kcal_day + 
+                            (1 | country),
+                 data = train_data_female_65_69,
+                 prior = prior(lognormal(log(1800), 0.25), class = "phi"),  # adjusted priors for phi
+                 control = list(adapt_delta = 0.9, max_treedepth = 15),
+                 family = Beta(link=logit),
+                 seed = 42,
+                 sample_prior = TRUE,
+                 save_pars = save_pars(all = TRUE),
+                 file = "mod_2_lognormal")
+
+powerscale_sensitivity(mod_1_lognormal)
+powerscale_sensitivity(mod_2_lognormal)
+
+```
+
+## Model Assessments
+
+#### Posterior Predictive Checks:
+
+-   Scatter plot of observed vs. predicted values
+-   Density plot of observed vs. predicted values
+-   Scatter plot of mean vs. standard deviation
+
+
+mod_1_lognormal: The density plot shows that the draws for posterior predictive distribution conform well to the shape of the observed data, save for not being able to capture the local maximum at x=0.5. However, this is quite marginal, as the trend of the observed data is captured well in general. Additionally, the scatter plot of observed vs. predicted values shows the mean and standard deviation of the observed data to be roughly in the center of the cloud of the means and standard deviations of the predicted data. Taken together, it appears that the model predicts the data quite well. Finally, the observed data seem to fit well overall in the predictions with respect to log GDP per capita, except for in a few countries (which appear as snake-like clusters in the "intervals" plot).
+
+mod_2_lognormal: The scatter plot of the observed versus predicted values depicts the mean and standard deviation of the observed data to fall in the center of the predicted means/standard deviations. Also, the draws for the density plot all follow the shape of the observed data distribution closely. Therefore, the model seems to fit the data well.
+
+
+```{r}
+
+# Posterior Predictive Checks for first model
+pp_check(mod_1_lognormal, type = "intervals",
+         x = "s_log_gdp_per_cap",
+         prob_outer = .95) + 
+  xlab("s_log_gdp_per_cap")
+pp_check(mod_1_lognormal, ndraws = 200)
+pp_check(mod_1_lognormal, type = "stat_2d")
+
+# Posterior Predictive Checks for second model
+pp_check(mod_2_lognormal, 
+         type = "intervals",
+         x = 's_log_mean_prev_obese',      
+         prob_outer = .95)
+pp_check(mod_2_lognormal, ndraws = 200)
+pp_check(mod_2_lognormal, type = "stat_2d")
+
+```
+
+## 5. Model Comparison
+
+```{r}
+# Check size of models
+nrow(train_data_female_65_69)
+nobs(mod_1_lognormal)
+nobs(mod_2_lognormal)
+
+```
+
+### k-fold cross-validation to compare the models.
+
+```{r}
+
+# k-fold cross-validation
+set.seed(42)
+kfold_folds <- loo::kfold_split_random(
+  K = 10,
+  N = nrow(train_data_female_65_69)
+)
+
+```
+
+```{r}
+set.seed(42)
+
+kf_mod_1   <- kfold(mod_1_lognormal, chains = 1, folds = kfold_folds, save_fits = TRUE)
+kf_mod_2   <- kfold(mod_2_lognormal, chains = 1, folds = kfold_folds, save_fits = TRUE)
+
+```
+
+```{r}
+data.frame(
+  model = c("Model 1", "Model 2"),
+  elpd_kfold = c(kf_mod_1$estimates["elpd_kfold", "Estimate"],
+                 kf_mod_2$estimates["elpd_kfold", "Estimate"]),
+  se = c(kf_mod_1$estimates["elpd_kfold", "SE"],
+         kf_mod_2$estimates["elpd_kfold", "SE"])
+)
+
+```
+
+After using 10-fold cross-validation to compare the models, both were found to perform very well on predictive accuracy, with an expected log predictive density (ELPD) of 1130.32 and 1124.90, respectively. Additionally, model 1 had SE =16.17 and model 2 had SE=15.44, meaning that the difference in ELPD between the two models are not significantly different from each other, since their difference is well below each of their SEs. Therefore, both models are likely to generalize well on unseen data. However, as model 1 had Rhats of 1.00 and ESS > 1,000, this model seems more dependable than model 2, which had two Rhats of 1.01 and some ESS values < 1,000. Therefore, the estimates for model 1 are slightly more stable, and it's parameters will be discussed in the following section.
+
+## 6. Interpretation of Parameters
+
+All numerical features included in model 1 were scaled and centered. This model included two health-related features — log-transformed obesity prevalence, and log-transformed average calories of trans fats consumed per day — as well as year to capture the decreasing trend observed in proportion of CVD deaths from 2008 to 2019. This model also included log-transformed GDP per capita, to test whether the average economic conditions for our chosen demographic (women aged 65-69 years) would predict proportion of CVD deaths. Finally, to account for the observed variation in proportion of CVD deaths by country as well as by region, the model included the nested grouping factor of (1 \| region/country). This allowed for partial pooling to explore potential differences between regions, as well as between countries after controlling for region.
+
+#### Parameter interpretation
+
+\*Note: Because the model fit a Beta regression with a logit link, the coefficients in the output are in log-odds. Therefore, estimated proportions will be provided for added clarity when appropriate.
+
+#### Regression Coefficients
+
+The intercept estimate was -0.91, with a CI [-1.56, -0.23]. Considering the centered predictors, this estimate represents the baseline proportion of CVD deaths in our target demographic with the average values for log obesity prevalence, log trans fat calories per day, and log gdp per capita in the year 2013. In proportions, the estimate is 0.29.
+
+The fixed effect estimate for the scaled year was -0.11, with a CI [-0.12, -0.09]. The confidence interval contains exclusively large negative log-odds values, meaning that we can be reasonably certain of a negative effect. Therefore, it is estimated that every unit change in scaled year corresponds to a 0.11 decrease in log-odds of proportion of CVD deaths, when other predictors are at their mean. For example, a unit increase in scaled year would lead to an estimated log-odds -1.02, or a proportion of 0.27.
+
+The fixed effect estimate for the scaled log of trans fat calories per day was 0.01, with a CI [-0.00, 0.03]. The confidence interval includes 0, so we cannot be certain of a positive effect on log trans-fat consumption on proportion of CVD death rate after controlling for other predictors.
+
+The fixed effect estimate for the scaled log of obesity prevalence was 0.15, with a CI [0.03, 0.25]. The confidence interval suggests that we can be reasonably certain of an estimated positive effect of log obesity prevalence on CVD death proportion when controlling for other predictors. Therefore, a unit increase in log of obesity prevalence from the scaled mean is estimated to have a log odds of -0.76 (or a proportion of 0.32).
+
+#### Multilevel Effects
+
+The intercept estimate for the multilevel effect of region (with 7 levels) was 0.80, with a CI [0.41, 1.57]. The log-odds represented in the CI are positive and quite high, which suggests significant variation between regions. Therefore, the estimated intercepts per region differ from the overall intercept by an average of 0.80 log-odds. Given the main intercept of -0.91, the log-odds range of the differences would be (-1.71, -0.11). Translated to proportions of CVD deaths, this would be (0.15, 0.47).
+
+The intercept estimate for the nested multilevel effect of country by region (with 38 levels) was 0.25, with a CI [0.20, 0.33]. This CI was less extreme than for region alone, but nonetheless suggests a strong variation between countries when controlling for region. The estimated intercepts per country, controlling for region, differ from the overall intercept by log-odds of 0.25. Considering the main intercept of -0.91, the log-odds range of the differences would be (-1.16, -0.66), or (0.24, 0.34) when translated to proportion of CVD deaths.
+
+#### Beta Distribution Parameters
+
+Finally, phi was estimated to be 1792.74 with a CI[1537.02, 2075.05]. This parameter corresponds to the degree to which the predictions are dispersed. As higher phi values indicate lower dispersion, the estimated phi value suggests very low dispersion, indicating that predictions are densely clustered around the mean.
+
+## 7. Reporting a loss function (RMSE and MAE)
+
+```{r}
+
+# Get predicted and observed values 
+fitted_vals <- fitted(mod_1_lognormal, newdata = test_data_female_65_69)
+pred_vals <- fitted_vals[, "Estimate"]
+observed_vals <- test_data_female_65_69$proportion_of_cvd_deaths
+
+# Calculate RMSE and MAE
+rmse <- sqrt(mean((pred_vals - observed_vals)^2))
+mae <- mean(abs(pred_vals - observed_vals))
+
+cat("test RMSE:", round(rmse, 4))
+cat('\n')
+cat("test MAE:", round(mae, 4))
+
+
+# Plotting predicted and observed values 
+predictions_plot <- data.frame(
+  observed = observed_vals,
+  predicted = pred_vals
+)
+
+ggplot(predictions_plot, aes(x = observed, y = predicted)) +
+  geom_point(alpha=0.8, color='darkgreen') +
+  geom_abline(slope = 1, intercept = 0, color = "darkred", linetype = "dashed") +
+  labs(title = "Proportion of CVD Deaths: Predicted vs. Observed Values",
+       x = "Observed", y = "Predicted") +
+  theme_bw()
+
+```
+
+# References
+
+Institute for Health Metrics and Evaluation. (n.d.). GBD Results Tool. Viz Hub. <https://vizhub.healthdata.org/gbd-results/>
+
+Our World in Data. (n.d.). Share of adults who are smoking by level of prosperity [Data set]. Based on data from World Health Organization (2024); World Bank (2025); HYDE (2023); Gapminder – Population v7 (2022); UN World Population Prospects (2024); Gapminder – Systema Globalis (2022). <https://ourworldindata.org/grapher/share-of-adults-who-are-smoking-by-level-of-prosperity>
+
+Our World in Data. (n.d.). GDP per capita (World Bank) [Data set]. Based on data compiled from multiple sources by the World Bank (2025), with minor processing by Our World in Data. <https://ourworldindata.org/grapher/gdp-per-capita-worldbank>
